@@ -10,6 +10,16 @@
 (define-constant ERR_PREMIUM_NOT_PAID (err u108))
 (define-constant ERR_COVERAGE_EXPIRED (err u109))
 
+(define-constant ERR_EMERGENCY_REQUEST_NOT_FOUND (err u110))
+(define-constant ERR_INSUFFICIENT_EMERGENCY_FUND (err u111))
+(define-constant ERR_ALREADY_VOTED (err u112))
+(define-constant ERR_CANNOT_VOTE_OWN_REQUEST (err u113))
+(define-constant ERR_REQUEST_ALREADY_PROCESSED (err u114))
+
+(define-data-var emergency-fund-balance uint u0)
+(define-data-var next-emergency-request-id uint u1)
+(define-data-var required-votes-percentage uint u60)
+
 (define-data-var next-member-id uint u1)
 (define-data-var next-claim-id uint u1)
 (define-data-var monthly-premium uint u50000000)
@@ -310,4 +320,145 @@
     (var-set max-coverage-amount new-max)
     (ok true)
   )
+)
+
+(define-map emergency-fund-contributions
+  { member-id: uint }
+  { total-contributed: uint }
+)
+
+(define-map emergency-requests
+  { request-id: uint }
+  {
+    requesting-member-id: uint,
+    amount: uint,
+    reason: (string-ascii 200),
+    submission-block: uint,
+    votes-for: uint,
+    votes-against: uint,
+    status: (string-ascii 20),
+    processed-block: (optional uint)
+  }
+)
+
+(define-map emergency-votes
+  { request-id: uint, voter-member-id: uint }
+  { vote: bool }
+)
+
+(define-public (contribute-to-emergency-fund (amount uint))
+  (let
+    (
+      (member-data (unwrap! (get-member-by-wallet tx-sender) ERR_NOT_ENROLLED))
+      (member-id (get member-id member-data))
+      (current-contributions (default-to { total-contributed: u0 } 
+        (map-get? emergency-fund-contributions { member-id: member-id })))
+    )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set emergency-fund-contributions
+      { member-id: member-id }
+      { total-contributed: (+ (get total-contributed current-contributions) amount) }
+    )
+    (var-set emergency-fund-balance (+ (var-get emergency-fund-balance) amount))
+    (ok true)
+  )
+)
+
+(define-public (request-emergency-withdrawal (amount uint) (reason (string-ascii 200)))
+  (let
+    (
+      (member-data (unwrap! (get-member-by-wallet tx-sender) ERR_NOT_ENROLLED))
+      (member-id (get member-id member-data))
+      (member-info (unwrap! (map-get? members { member-id: member-id }) ERR_NOT_ENROLLED))
+      (request-id (var-get next-emergency-request-id))
+    )
+    (asserts! (get is-active member-info) ERR_NOT_ENROLLED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= amount (var-get emergency-fund-balance)) ERR_INSUFFICIENT_EMERGENCY_FUND)
+    (map-set emergency-requests
+      { request-id: request-id }
+      {
+        requesting-member-id: member-id,
+        amount: amount,
+        reason: reason,
+        submission-block: stacks-block-height,
+        votes-for: u0,
+        votes-against: u0,
+        status: "pending",
+        processed-block: none
+      }
+    )
+    (var-set next-emergency-request-id (+ request-id u1))
+    (ok request-id)
+  )
+)
+
+(define-public (vote-on-emergency-request (request-id uint) (vote-for bool))
+  (let
+    (
+      (member-data (unwrap! (get-member-by-wallet tx-sender) ERR_NOT_ENROLLED))
+      (voter-member-id (get member-id member-data))
+      (member-info (unwrap! (map-get? members { member-id: voter-member-id }) ERR_NOT_ENROLLED))
+      (request-info (unwrap! (map-get? emergency-requests { request-id: request-id }) ERR_EMERGENCY_REQUEST_NOT_FOUND))
+    )
+    (asserts! (get is-active member-info) ERR_NOT_ENROLLED)
+    (asserts! (not (is-eq voter-member-id (get requesting-member-id request-info))) ERR_CANNOT_VOTE_OWN_REQUEST)
+    (asserts! (is-eq (get status request-info) "pending") ERR_REQUEST_ALREADY_PROCESSED)
+    (asserts! (is-none (map-get? emergency-votes { request-id: request-id, voter-member-id: voter-member-id })) ERR_ALREADY_VOTED)
+    (map-set emergency-votes { request-id: request-id, voter-member-id: voter-member-id } { vote: vote-for })
+    (map-set emergency-requests
+      { request-id: request-id }
+      (merge request-info {
+        votes-for: (if vote-for (+ (get votes-for request-info) u1) (get votes-for request-info)),
+        votes-against: (if vote-for (get votes-against request-info) (+ (get votes-against request-info) u1))
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (process-emergency-request (request-id uint))
+  (let
+    (
+      (request-info (unwrap! (map-get? emergency-requests { request-id: request-id }) ERR_EMERGENCY_REQUEST_NOT_FOUND))
+      (total-votes (+ (get votes-for request-info) (get votes-against request-info)))
+      (approval-percentage (if (> total-votes u0) 
+        (/ (* (get votes-for request-info) u100) total-votes) u0))
+      (member-info (unwrap! (map-get? members { member-id: (get requesting-member-id request-info) }) ERR_NOT_ENROLLED))
+      (member-wallet (get wallet member-info))
+    )
+    (asserts! (is-eq (get status request-info) "pending") ERR_REQUEST_ALREADY_PROCESSED)
+    (asserts! (>= total-votes u3) ERR_INSUFFICIENT_BALANCE)
+    (if (>= approval-percentage (var-get required-votes-percentage))
+      (begin
+        (try! (as-contract (stx-transfer? (get amount request-info) tx-sender member-wallet)))
+        (var-set emergency-fund-balance (- (var-get emergency-fund-balance) (get amount request-info)))
+        (map-set emergency-requests
+          { request-id: request-id }
+          (merge request-info { status: "approved", processed-block: (some stacks-block-height) })
+        )
+        (ok "approved")
+      )
+      (begin
+        (map-set emergency-requests
+          { request-id: request-id }
+          (merge request-info { status: "rejected", processed-block: (some stacks-block-height) })
+        )
+        (ok "rejected")
+      )
+    )
+  )
+)
+
+(define-read-only (get-emergency-fund-stats)
+  {
+    total-fund-balance: (var-get emergency-fund-balance),
+    total-requests: (- (var-get next-emergency-request-id) u1),
+    required-approval-percentage: (var-get required-votes-percentage)
+  }
+)
+
+(define-read-only (get-emergency-request (request-id uint))
+  (map-get? emergency-requests { request-id: request-id })
 )
