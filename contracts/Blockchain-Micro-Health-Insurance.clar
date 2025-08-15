@@ -462,3 +462,83 @@
 (define-read-only (get-emergency-request (request-id uint))
   (map-get? emergency-requests { request-id: request-id })
 )
+
+
+(define-map member-payment-analytics
+  { member-id: uint }
+  {
+    current-streak: uint,
+    longest-streak: uint,
+    total-payments: uint,
+    missed-payments: uint,
+    last-payment-block: uint,
+    streak-start-block: uint,
+    risk-level: (string-ascii 10)
+  }
+)
+
+(define-map payment-history
+  { member-id: uint, payment-index: uint }
+  { payment-block: uint, amount: uint, was-late: bool }
+)
+
+(define-public (update-payment-analytics (member-id uint) (payment-amount uint) (current-block uint))
+  (let
+    (
+      (current-analytics (default-to 
+        { current-streak: u0, longest-streak: u0, total-payments: u0, 
+          missed-payments: u0, last-payment-block: u0, streak-start-block: u0, risk-level: "low" }
+        (map-get? member-payment-analytics { member-id: member-id })))
+      (member-info (unwrap! (map-get? members { member-id: member-id }) ERR_NOT_ENROLLED))
+      (blocks-since-last (if (> (get last-payment-block current-analytics) u0)
+        (- current-block (get last-payment-block current-analytics)) u0))
+      (was-late (> blocks-since-last u4320))
+      (missed-payment (and (> (get last-payment-block current-analytics) u0) (> blocks-since-last u8640)))
+      (new-streak (if missed-payment u1 (+ (get current-streak current-analytics) u1)))
+      (new-longest (if (> new-streak (get longest-streak current-analytics)) new-streak (get longest-streak current-analytics)))
+      (new-total (+ (get total-payments current-analytics) u1))
+      (new-missed (if missed-payment (+ (get missed-payments current-analytics) u1) (get missed-payments current-analytics)))
+      (risk-level (calculate-risk-level new-missed new-total blocks-since-last))
+    )
+    (map-set member-payment-analytics
+      { member-id: member-id }
+      {
+        current-streak: new-streak,
+        longest-streak: new-longest,
+        total-payments: new-total,
+        missed-payments: new-missed,
+        last-payment-block: current-block,
+        streak-start-block: (if (is-eq new-streak u1) current-block (get streak-start-block current-analytics)),
+        risk-level: risk-level
+      }
+    )
+    (map-set payment-history
+      { member-id: member-id, payment-index: (get total-payments current-analytics) }
+      { payment-block: current-block, amount: payment-amount, was-late: was-late }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (calculate-risk-level (missed uint) (total uint) (blocks-since-last uint))
+  (if (> blocks-since-last u3456) "high"
+    (if (> blocks-since-last u2160) "medium"
+      (if (and (> total u3) (> (* missed u100) (* total u20))) "medium" "low")
+    )
+  )
+)
+
+(define-read-only (get-member-analytics (member-id uint))
+  (map-get? member-payment-analytics { member-id: member-id })
+)
+
+(define-read-only (get-payment-history (member-id uint) (payment-index uint))
+  (map-get? payment-history { member-id: member-id, payment-index: payment-index })
+)
+
+(define-read-only (get-member-risk-assessment (member-id uint))
+  (match (map-get? member-payment-analytics { member-id: member-id })
+    analytics (get risk-level analytics)
+    "unknown"
+  )
+)
