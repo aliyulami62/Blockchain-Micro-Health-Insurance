@@ -16,6 +16,10 @@
 (define-constant ERR_CANNOT_VOTE_OWN_REQUEST (err u113))
 (define-constant ERR_REQUEST_ALREADY_PROCESSED (err u114))
 
+(define-constant MAX_DISCOUNT_PERCENTAGE u30)
+(define-constant POINTS_PER_STREAK_MONTH u50)
+(define-constant POINTS_EARLY_PAYMENT u25)
+
 (define-data-var emergency-fund-balance uint u0)
 (define-data-var next-emergency-request-id uint u1)
 (define-data-var required-votes-percentage uint u60)
@@ -541,4 +545,113 @@
     analytics (get risk-level analytics)
     "unknown"
   )
+)
+
+(define-map member-rewards
+  { member-id: uint }
+  {
+    total-points: uint,
+    current-discount-percentage: uint,
+    points-this-period: uint,
+    last-reward-calculation: uint,
+    achievement-level: (string-ascii 15)
+  }
+)
+
+(define-map reward-milestones
+  { level: uint }
+  { required-points: uint, discount-percentage: uint, level-name: (string-ascii 15) }
+)
+
+(define-public (initialize-reward-system)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (map-set reward-milestones { level: u1 } 
+      { required-points: u200, discount-percentage: u5, level-name: "Bronze" })
+    (map-set reward-milestones { level: u2 } 
+      { required-points: u500, discount-percentage: u10, level-name: "Silver" })
+    (map-set reward-milestones { level: u3 } 
+      { required-points: u1000, discount-percentage: u15, level-name: "Gold" })
+    (map-set reward-milestones { level: u4 } 
+      { required-points: u2000, discount-percentage: u25, level-name: "Platinum" })
+    (ok true)
+  )
+)
+
+(define-public (calculate-member-rewards (member-id uint))
+  (let
+    (
+      (member-analytics (map-get? member-payment-analytics { member-id: member-id }))
+      (current-rewards (default-to 
+        { total-points: u0, current-discount-percentage: u0, points-this-period: u0, 
+          last-reward-calculation: u0, achievement-level: "None" }
+        (map-get? member-rewards { member-id: member-id })))
+    )
+    (match member-analytics
+      analytics
+        (let
+          (
+            (streak-points (* (get current-streak analytics) POINTS_PER_STREAK_MONTH))
+            (bonus-points (if (is-eq (get risk-level analytics) "low") POINTS_EARLY_PAYMENT u0))
+            (new-total-points (+ (get total-points current-rewards) streak-points bonus-points))
+            (new-discount (calculate-discount-percentage new-total-points))
+            (achievement-level (get-achievement-level new-total-points))
+          )
+          (map-set member-rewards
+            { member-id: member-id }
+            {
+              total-points: new-total-points,
+              current-discount-percentage: new-discount,
+              points-this-period: (+ streak-points bonus-points),
+              last-reward-calculation: stacks-block-height,
+              achievement-level: achievement-level
+            }
+          )
+          (ok new-discount)
+        )
+      (ok u0)
+    )
+  )
+)
+
+(define-public (apply-premium-discount (member-id uint) (base-premium uint))
+  (let
+    (
+      (rewards-data (map-get? member-rewards { member-id: member-id }))
+    )
+    (match rewards-data
+      rewards
+        (let
+          (
+            (discount-percentage (get current-discount-percentage rewards))
+            (discount-amount (/ (* base-premium discount-percentage) u100))
+            (final-premium (- base-premium discount-amount))
+          )
+          (ok final-premium)
+        )
+      (ok base-premium)
+    )
+  )
+)
+
+(define-read-only (calculate-discount-percentage (points uint))
+  (if (>= points u2000) u25
+    (if (>= points u1000) u15
+      (if (>= points u500) u10
+        (if (>= points u200) u5 u0))))
+)
+
+(define-read-only (get-achievement-level (points uint))
+  (if (>= points u2000) "Platinum"
+    (if (>= points u1000) "Gold"
+      (if (>= points u500) "Silver"
+        (if (>= points u200) "Bronze" "None"))))
+)
+
+(define-read-only (get-member-rewards-info (member-id uint))
+  (map-get? member-rewards { member-id: member-id })
+)
+
+(define-read-only (get-reward-milestone (level uint))
+  (map-get? reward-milestones { level: level })
 )
