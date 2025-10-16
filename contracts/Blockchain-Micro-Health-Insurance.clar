@@ -20,6 +20,14 @@
 (define-constant POINTS_PER_STREAK_MONTH u50)
 (define-constant POINTS_EARLY_PAYMENT u25)
 
+(define-constant ERR_BENEFICIARY_NOT_FOUND (err u115))
+(define-constant ERR_BENEFICIARY_LIMIT_REACHED (err u116))
+(define-constant ERR_BENEFICIARY_ALREADY_EXISTS (err u117))
+(define-constant ERR_BENEFICIARY_COVERAGE_EXCEEDED (err u118))
+(define-constant MAX_BENEFICIARIES_PER_MEMBER u5)
+
+(define-data-var next-beneficiary-id uint u1)
+
 (define-data-var emergency-fund-balance uint u0)
 (define-data-var next-emergency-request-id uint u1)
 (define-data-var required-votes-percentage uint u60)
@@ -654,4 +662,114 @@
 
 (define-read-only (get-reward-milestone (level uint))
   (map-get? reward-milestones { level: level })
+)
+
+
+(define-map beneficiaries
+  { beneficiary-id: uint }
+  {
+    primary-member-id: uint,
+    beneficiary-wallet: principal,
+    relationship: (string-ascii 30),
+    individual-coverage-limit: uint,
+    total-claims-used: uint,
+    is-active: bool,
+    added-block: uint
+  }
+)
+
+(define-map member-beneficiary-count
+  { member-id: uint }
+  { count: uint }
+)
+
+(define-map beneficiary-wallet-lookup
+  { wallet: principal }
+  { beneficiary-id: uint }
+)
+
+(define-public (add-beneficiary (beneficiary-wallet principal) (relationship (string-ascii 30)) (coverage-limit uint))
+  (let
+    (
+      (member-data (unwrap! (get-member-by-wallet tx-sender) ERR_NOT_ENROLLED))
+      (primary-member-id (get member-id member-data))
+      (beneficiary-count-data (default-to { count: u0 } (map-get? member-beneficiary-count { member-id: primary-member-id })))
+      (current-count (get count beneficiary-count-data))
+      (beneficiary-id (var-get next-beneficiary-id))
+    )
+    (asserts! (< current-count MAX_BENEFICIARIES_PER_MEMBER) ERR_BENEFICIARY_LIMIT_REACHED)
+    (asserts! (is-none (map-get? beneficiary-wallet-lookup { wallet: beneficiary-wallet })) ERR_BENEFICIARY_ALREADY_EXISTS)
+    (asserts! (> coverage-limit u0) ERR_INVALID_AMOUNT)
+    (map-set beneficiaries
+      { beneficiary-id: beneficiary-id }
+      {
+        primary-member-id: primary-member-id,
+        beneficiary-wallet: beneficiary-wallet,
+        relationship: relationship,
+        individual-coverage-limit: coverage-limit,
+        total-claims-used: u0,
+        is-active: true,
+        added-block: stacks-block-height
+      }
+    )
+    (map-set beneficiary-wallet-lookup { wallet: beneficiary-wallet } { beneficiary-id: beneficiary-id })
+    (map-set member-beneficiary-count { member-id: primary-member-id } { count: (+ current-count u1) })
+    (var-set next-beneficiary-id (+ beneficiary-id u1))
+    (ok beneficiary-id)
+  )
+)
+
+(define-public (deactivate-beneficiary (beneficiary-id uint))
+  (let
+    (
+      (beneficiary-info (unwrap! (map-get? beneficiaries { beneficiary-id: beneficiary-id }) ERR_BENEFICIARY_NOT_FOUND))
+      (member-data (unwrap! (get-member-by-wallet tx-sender) ERR_NOT_ENROLLED))
+      (primary-member-id (get member-id member-data))
+    )
+    (asserts! (is-eq (get primary-member-id beneficiary-info) primary-member-id) ERR_UNAUTHORIZED)
+    (map-set beneficiaries
+      { beneficiary-id: beneficiary-id }
+      (merge beneficiary-info { is-active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (submit-claim-as-beneficiary (provider principal) (treatment-type (string-ascii 100)) (amount uint))
+  (let
+    (
+      (beneficiary-lookup (unwrap! (map-get? beneficiary-wallet-lookup { wallet: tx-sender }) ERR_BENEFICIARY_NOT_FOUND))
+      (beneficiary-id (get beneficiary-id beneficiary-lookup))
+      (beneficiary-info (unwrap! (map-get? beneficiaries { beneficiary-id: beneficiary-id }) ERR_BENEFICIARY_NOT_FOUND))
+      (primary-member-id (get primary-member-id beneficiary-info))
+      (primary-member-info (unwrap! (map-get? members { member-id: primary-member-id }) ERR_NOT_ENROLLED))
+      (new-total-used (+ (get total-claims-used beneficiary-info) amount))
+    )
+    (asserts! (get is-active beneficiary-info) ERR_BENEFICIARY_NOT_FOUND)
+    (asserts! (get is-active primary-member-info) ERR_NOT_ENROLLED)
+    (asserts! (is-coverage-active primary-member-info stacks-block-height) ERR_COVERAGE_EXPIRED)
+    (asserts! (<= new-total-used (get individual-coverage-limit beneficiary-info)) ERR_BENEFICIARY_COVERAGE_EXCEEDED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (is-provider-verified provider) ERR_INVALID_PROVIDER)
+    (map-set beneficiaries
+      { beneficiary-id: beneficiary-id }
+      (merge beneficiary-info { total-claims-used: new-total-used })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-beneficiary-info (beneficiary-id uint))
+  (map-get? beneficiaries { beneficiary-id: beneficiary-id })
+)
+
+(define-read-only (get-beneficiary-by-wallet (wallet principal))
+  (match (map-get? beneficiary-wallet-lookup { wallet: wallet })
+    lookup-data (map-get? beneficiaries { beneficiary-id: (get beneficiary-id lookup-data) })
+    none
+  )
+)
+
+(define-read-only (get-member-beneficiary-count (member-id uint))
+  (default-to { count: u0 } (map-get? member-beneficiary-count { member-id: member-id }))
 )
