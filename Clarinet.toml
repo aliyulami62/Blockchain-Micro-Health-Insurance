@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Blockchain-Micro-Health-Insurance.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.multi-sig-claims]
+path = 'contracts/multi-sig-claims.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
